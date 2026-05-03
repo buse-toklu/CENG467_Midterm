@@ -1,0 +1,497 @@
+import os
+import json
+import random
+import warnings
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+# ── Reproducibility ──────────────────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+os.environ["PYTHONHASHSEED"] = str(SEED)
+
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("[WARN] PyTorch not available – BiLSTM will be skipped.")
+
+# ── Imports ───────────────────────────────────────────────────────────────────
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.model_selection import train_test_split
+from datasets import load_dataset
+
+# 1. DATA LOADING
+def load_sst2():
+    """Load SST-2 from HuggingFace datasets.
+
+    SST-2 properties:
+      - Binary sentiment (0=negative, 1=positive)
+      - ~67k train / ~872 validation / ~1,821 test sentences
+      - Single-sentence movie reviews
+      - Mean token length ~11 words (short sentences)
+    """
+    print("[1/5] Loading SST-2 dataset...")
+    dataset = load_dataset("sst2", trust_remote_code=True)
+
+    train_texts = dataset["train"]["sentence"]
+    train_labels = dataset["train"]["label"]
+    val_texts   = list(dataset["validation"]["sentence"])
+    val_labels  = list(dataset["validation"]["label"])
+
+    # SST-2 test labels are -1 (hidden); use validation as test
+    # Re-split train into train+dev 90/10 for model selection
+    # Convert to plain Python lists to avoid numpy.int64 index errors
+    # with HuggingFace dataset indexing
+    train_texts  = list(train_texts)
+    train_labels = list(train_labels)
+
+    tr_texts, dev_texts, tr_labels, dev_labels = train_test_split(
+        train_texts, train_labels,
+        test_size=0.10, random_state=SEED, stratify=train_labels
+    )
+
+    print(f"  Train: {len(tr_texts):,} | Dev: {len(dev_texts):,} | Test: {len(val_texts):,}")
+    class_counts = pd.Series(train_labels).value_counts()
+    print(f"  Class distribution (full train): {dict(class_counts)}")
+    return tr_texts, tr_labels, dev_texts, dev_labels, val_texts, val_labels
+
+# 2. PREPROCESSING
+import re
+import string
+
+STOPWORDS = {
+    "a","an","the","is","it","in","on","at","to","of","and","or","but",
+    "not","no","so","as","be","are","was","were","has","had","have","will",
+    "would","could","should","may","might","shall","do","does","did"
+}
+
+def preprocess_basic(text: str, remove_stopwords: bool = False,
+                     lowercase: bool = True) -> str:
+    """Basic preprocessing: lowercase, punctuation strip, optional stopword removal."""
+    if lowercase:
+        text = text.lower()
+    text = re.sub(r"<[^>]+>", " ", text)           # strip HTML
+    text = re.sub(r"http\S+", " ", text)            # strip URLs
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    text = re.sub(r"\s+", " ", text).strip()
+    if remove_stopwords:
+        text = " ".join(w for w in text.split() if w not in STOPWORDS)
+    return text
+
+
+def preprocess_corpus(texts, remove_stopwords=False, lowercase=True):
+    return [preprocess_basic(t, remove_stopwords=remove_stopwords,
+                             lowercase=lowercase) for t in texts]
+
+# 3. MODEL A – TF-IDF + LOGISTIC REGRESSION / SVM
+def build_tfidf_lr():
+    """TF-IDF (unigram+bigram) + Logistic Regression pipeline."""
+    return Pipeline([
+        ("tfidf", TfidfVectorizer(
+            ngram_range=(1, 2),
+            max_features=50_000,
+            sublinear_tf=True,
+            min_df=2,
+        )),
+        ("clf", LogisticRegression(
+            C=1.0,
+            max_iter=1000,
+            solver="lbfgs",
+            multi_class="auto",
+            random_state=SEED,
+        ))
+    ])
+
+
+def build_tfidf_svm():
+    """TF-IDF (unigram only, character n-grams) + LinearSVC pipeline."""
+    return Pipeline([
+        ("tfidf", TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 1),
+            max_features=30_000,
+            sublinear_tf=True,
+            min_df=2,
+        )),
+        ("clf", LinearSVC(C=0.5, max_iter=2000, random_state=SEED))
+    ])
+
+
+def train_classical(tr_texts, tr_labels, dev_texts, dev_labels,
+                    test_texts, test_labels, model_name="LR"):
+    print(f"\n[2/5] Training TF-IDF + {model_name}...")
+
+    tr_clean   = preprocess_corpus(tr_texts, remove_stopwords=False)
+    dev_clean  = preprocess_corpus(dev_texts, remove_stopwords=False)
+    test_clean = preprocess_corpus(test_texts, remove_stopwords=False)
+
+    model = build_tfidf_lr() if model_name == "LR" else build_tfidf_svm()
+    model.fit(tr_clean, tr_labels)
+
+    dev_preds  = model.predict(dev_clean)
+    test_preds = model.predict(test_clean)
+
+    results = evaluate(test_labels, test_preds, dev_labels, dev_preds,
+                       model_name=f"TF-IDF+{model_name}")
+    return model, test_preds, results
+
+# 4. MODEL B – BiLSTM
+def train_bilstm(tr_texts, tr_labels, dev_texts, dev_labels,
+                 test_texts, test_labels):
+    if not TORCH_AVAILABLE:
+        print("\n[3/5] Skipping BiLSTM (PyTorch unavailable).")
+        return None, None, None
+
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader
+    from collections import Counter
+
+    print("\n[3/5] Training BiLSTM...")
+
+    # ── Tokenisation & Vocabulary ──────────────────────────────────────────
+    def simple_tokenize(text):
+        text = preprocess_basic(text, lowercase=True)
+        return text.split()
+
+    MAX_LEN   = 64
+    EMBED_DIM = 128
+    HIDDEN    = 256
+    EPOCHS    = 5
+    BATCH     = 64
+    LR_RATE   = 1e-3
+
+    # Build vocab from training set
+    counter = Counter()
+    for t in tr_texts:
+        counter.update(simple_tokenize(t))
+
+    vocab = {"<PAD>": 0, "<UNK>": 1}
+    for word, freq in counter.items():
+        if freq >= 2:
+            vocab[word] = len(vocab)
+    VOCAB_SIZE = len(vocab)
+    print(f"  Vocabulary size: {VOCAB_SIZE:,}")
+
+    def encode(texts):
+        encoded = []
+        for t in texts:
+            ids = [vocab.get(w, 1) for w in simple_tokenize(t)[:MAX_LEN]]
+            ids += [0] * (MAX_LEN - len(ids))
+            encoded.append(ids)
+        return torch.tensor(encoded, dtype=torch.long)
+
+    # ── Dataset ────────────────────────────────────────────────────────────
+    class SentimentDataset(Dataset):
+        def __init__(self, X, y):
+            self.X = X
+            self.y = torch.tensor(y, dtype=torch.long)
+        def __len__(self): return len(self.y)
+        def __getitem__(self, i): return self.X[i], self.y[i]
+
+    tr_X = encode(list(tr_texts))
+    dv_X = encode(list(dev_texts))
+    te_X = encode(list(test_texts))
+
+    tr_loader = DataLoader(SentimentDataset(tr_X, list(tr_labels)),
+                           batch_size=BATCH, shuffle=True)
+    dv_loader = DataLoader(SentimentDataset(dv_X, list(dev_labels)),
+                           batch_size=BATCH)
+    te_loader = DataLoader(SentimentDataset(te_X, list(test_labels)),
+                           batch_size=BATCH)
+
+    # ── Model ──────────────────────────────────────────────────────────────
+    class BiLSTMClassifier(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed   = nn.Embedding(VOCAB_SIZE, EMBED_DIM, padding_idx=0)
+            self.lstm    = nn.LSTM(EMBED_DIM, HIDDEN, batch_first=True,
+                                  bidirectional=True, dropout=0.3, num_layers=2)
+            self.dropout = nn.Dropout(0.5)
+            self.fc      = nn.Linear(HIDDEN * 2, 2)
+
+        def forward(self, x):
+            emb = self.dropout(self.embed(x))
+            out, (h, _) = self.lstm(emb)
+            h = torch.cat([h[-2], h[-1]], dim=1)   # last layer fwd+bwd
+            return self.fc(self.dropout(h))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"  Device: {device}")
+
+    net = BiLSTMClassifier().to(device)
+    optimizer = torch.optim.Adam(net.parameters(), lr=LR_RATE, weight_decay=1e-5)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=1, factor=0.5)
+
+    best_val_acc = 0
+    best_state   = None
+
+    for epoch in range(EPOCHS):
+        net.train()
+        total_loss = 0
+        for X_b, y_b in tr_loader:
+            X_b, y_b = X_b.to(device), y_b.to(device)
+            optimizer.zero_grad()
+            loss = criterion(net(X_b), y_b)
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+
+        # Validation
+        net.eval()
+        val_preds, val_true = [], []
+        with torch.no_grad():
+            for X_b, y_b in dv_loader:
+                preds = net(X_b.to(device)).argmax(dim=1).cpu().numpy()
+                val_preds.extend(preds)
+                val_true.extend(y_b.numpy())
+        val_acc = accuracy_score(val_true, val_preds)
+        scheduler.step(1 - val_acc)
+
+        print(f"  Epoch {epoch+1}/{EPOCHS} | loss={total_loss/len(tr_loader):.4f}"
+              f" | val_acc={val_acc:.4f}")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state   = {k: v.clone() for k, v in net.state_dict().items()}
+
+    # ── Evaluation on test ─────────────────────────────────────────────────
+    net.load_state_dict(best_state)
+    net.eval()
+    test_preds, test_true = [], []
+    with torch.no_grad():
+        for X_b, y_b in te_loader:
+            preds = net(X_b.to(device)).argmax(dim=1).cpu().numpy()
+            test_preds.extend(preds)
+            test_true.extend(y_b.numpy())
+
+    dev_preds_final = []
+    with torch.no_grad():
+        for X_b, y_b in dv_loader:
+            p = net(X_b.to(device)).argmax(dim=1).cpu().numpy()
+            dev_preds_final.extend(p)
+
+    results = evaluate(list(test_labels), test_preds,
+                       list(dev_labels), dev_preds_final,
+                       model_name="BiLSTM")
+    return net, test_preds, results
+
+# 5. MODEL C – DistilBERT
+def train_distilbert(tr_texts, tr_labels, dev_texts, dev_labels,
+                     test_texts, test_labels):
+    try:
+        from transformers import (DistilBertTokenizerFast,
+                                  DistilBertForSequenceClassification,
+                                  Trainer, TrainingArguments,
+                                  EarlyStoppingCallback)
+        import torch
+        from torch.utils.data import Dataset as TorchDataset
+    except ImportError:
+        print("\n[4/5] Skipping DistilBERT (transformers unavailable).")
+        return None, None, None
+
+    print("\n[4/5] Fine-tuning DistilBERT...")
+
+    MODEL_NAME = "distilbert-base-uncased"
+    MAX_LEN    = 128
+    EPOCHS     = 3
+    BATCH      = 32
+    LR_RATE    = 2e-5
+
+    tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_NAME)
+
+    class HFDataset(TorchDataset):
+        def __init__(self, texts, labels):
+            self.enc = tokenizer(
+                list(texts), truncation=True, padding="max_length",
+                max_length=MAX_LEN, return_tensors="pt"
+            )
+            self.labels = torch.tensor(list(labels), dtype=torch.long)
+        def __len__(self): return len(self.labels)
+        def __getitem__(self, i):
+            return {k: v[i] for k, v in self.enc.items()} | {"labels": self.labels[i]}
+
+    tr_ds  = HFDataset(tr_texts, tr_labels)
+    dv_ds  = HFDataset(dev_texts, dev_labels)
+    te_ds  = HFDataset(test_texts, test_labels)
+
+    model = DistilBertForSequenceClassification.from_pretrained(
+        MODEL_NAME, num_labels=2)
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=1)
+        return {
+            "accuracy": accuracy_score(labels, preds),
+            "f1": f1_score(labels, preds, average="macro")
+        }
+
+    training_args = TrainingArguments(
+        output_dir="./distilbert_output",
+        num_train_epochs=EPOCHS,
+        per_device_train_batch_size=BATCH,
+        per_device_eval_batch_size=BATCH,
+        learning_rate=LR_RATE,
+        warmup_ratio=0.06,
+        weight_decay=0.01,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+        logging_steps=100,
+        seed=SEED,
+        fp16=torch.cuda.is_available(),
+        report_to="none",
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tr_ds,
+        eval_dataset=dv_ds,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+    )
+
+    trainer.train()
+
+    # ── Test predictions ───────────────────────────────────────────────────
+    raw = trainer.predict(te_ds)
+    test_preds = np.argmax(raw.predictions, axis=1).tolist()
+
+    raw_dev = trainer.predict(dv_ds)
+    dev_preds = np.argmax(raw_dev.predictions, axis=1).tolist()
+
+    results = evaluate(list(test_labels), test_preds,
+                       list(dev_labels), dev_preds,
+                       model_name="DistilBERT")
+    return model, test_preds, results
+
+# 6. EVALUATION UTILITIES
+def evaluate(test_true, test_preds, dev_true, dev_preds, model_name="Model"):
+    test_acc = accuracy_score(test_true, test_preds)
+    test_f1  = f1_score(test_true, test_preds, average="macro")
+    dev_acc  = accuracy_score(dev_true, dev_preds)
+    dev_f1   = f1_score(dev_true, dev_preds, average="macro")
+
+    print(f"\n  ── {model_name} Results ──")
+    print(f"  Dev  | Acc: {dev_acc:.4f} | Macro-F1: {dev_f1:.4f}")
+    print(f"  Test | Acc: {test_acc:.4f} | Macro-F1: {test_f1:.4f}")
+    print(f"\n{classification_report(test_true, test_preds, target_names=['Neg','Pos'])}")
+
+    return {
+        "model": model_name,
+        "dev_acc": round(dev_acc, 4),
+        "dev_f1":  round(dev_f1, 4),
+        "test_acc": round(test_acc, 4),
+        "test_f1":  round(test_f1, 4),
+    }
+
+
+def misclassification_analysis(test_texts, test_labels, test_preds,
+                                model_name, n=10):
+    """Print and return misclassified examples."""
+    label_map = {0: "Negative", 1: "Positive"}
+    errors = [
+        {"text": t, "true": label_map[int(l)], "pred": label_map[int(p)]}
+        for t, l, p in zip(test_texts, test_labels, test_preds)
+        if int(l) != int(p)
+    ]
+    print(f"\n  ── {model_name}: {len(errors)} misclassifications "
+          f"({len(errors)/len(test_labels)*100:.1f}%) ──")
+    print(f"  Showing first {min(n, len(errors))} examples:\n")
+    for i, e in enumerate(errors[:n]):
+        print(f"  [{i+1}] TRUE={e['true']} | PRED={e['pred']}")
+        print(f"       \"{e['text'][:120]}\"")
+    return errors
+
+def main():
+    print("=" * 65)
+    print("  Representation Learning in Text Classification")
+    print("  Dataset: SST-2 | Seed:", SEED)
+    print("=" * 65)
+
+    # Load data
+    tr_texts, tr_labels, dev_texts, dev_labels, test_texts, test_labels = load_sst2()
+
+    all_results = []
+
+    # Model A1: TF-IDF + Logistic Regression
+    lr_model, lr_preds, lr_results = train_classical(
+        tr_texts, tr_labels, dev_texts, dev_labels,
+        test_texts, test_labels, model_name="LR"
+    )
+    all_results.append(lr_results)
+
+    # Model A2: TF-IDF + SVM
+    svm_model, svm_preds, svm_results = train_classical(
+        tr_texts, tr_labels, dev_texts, dev_labels,
+        test_texts, test_labels, model_name="SVM"
+    )
+    all_results.append(svm_results)
+
+    # Model B: BiLSTM
+    bilstm_model, bilstm_preds, bilstm_results = train_bilstm(
+        tr_texts, tr_labels, dev_texts, dev_labels, test_texts, test_labels
+    )
+    if bilstm_results:
+        all_results.append(bilstm_results)
+
+    # Model C: DistilBERT
+    bert_model, bert_preds, bert_results = train_distilbert(
+        tr_texts, tr_labels, dev_texts, dev_labels, test_texts, test_labels
+    )
+    if bert_results:
+        all_results.append(bert_results)
+
+    # ── Misclassification Analysis ─────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print("  MISCLASSIFICATION ANALYSIS")
+    print("=" * 65)
+
+    test_texts_list  = list(test_texts)
+    test_labels_list = list(test_labels)
+
+    lr_errors = misclassification_analysis(
+        test_texts_list, test_labels_list, lr_preds, "TF-IDF+LR", n=5
+    )
+    if bert_preds is not None:
+        bert_errors = misclassification_analysis(
+            test_texts_list, test_labels_list, bert_preds, "DistilBERT", n=5
+        )
+
+    # ── Summary Table ──────────────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print("  FINAL RESULTS SUMMARY")
+    print("=" * 65)
+    df = pd.DataFrame(all_results)
+    print(df.to_string(index=False))
+
+    # Save results
+    Path("results").mkdir(exist_ok=True)
+    df.to_csv("results/summary.csv", index=False)
+    with open("results/lr_errors.json", "w") as f:
+        json.dump(lr_errors[:20], f, indent=2)
+
+    print("\n[5/5] Results saved to ./results/")
+    return df
+
+
+if __name__ == "__main__":
+    main()
